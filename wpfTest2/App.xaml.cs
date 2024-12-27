@@ -1,5 +1,7 @@
-﻿using System.Windows;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using FFmpeg.AutoGen;
+using System.Windows;
 
 namespace WpfVideoPlayer
 {
@@ -8,20 +10,14 @@ namespace WpfVideoPlayer
     /// </summary>
     public partial class App : Application
     {
+        private ServiceProvider serviceProvider;
+
         static App()
         {
             try
             {
-                // string ffmpegPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FFmpeg", "x64");
-                // if (!Directory.Exists(ffmpegPath))
-                // {
-                //     throw new DirectoryNotFoundException($"FFmpeg directory not found at: {ffmpegPath}");
-                // }
                 FFmpegBinariesHelper.RegisterFFmpegBinaries();
-
                 Console.WriteLine($"FFmpeg version info: {ffmpeg.av_version_info()}");
-
-                // 初始化 FFmpeg
                 ffmpeg.avdevice_register_all();
                 ffmpeg.avformat_network_init();
             }
@@ -31,6 +27,45 @@ namespace WpfVideoPlayer
                 Current.Shutdown();
             }
         }
-    }
 
+        public App()
+        {
+            var services = new ServiceCollection();
+            ConfigureServices(services);
+            serviceProvider = services.BuildServiceProvider();
+        }
+
+        private void ConfigureServices(IServiceCollection services)
+        {
+            services.AddLogging(builder =>
+            {
+                builder.AddConsole();
+                builder.AddDebug();
+                // 可以添加文件日志
+                // builder.AddFile("logs/videoplayer-{Date}.txt");
+            });
+
+            // 注册主窗口
+            services.AddSingleton<MainWindow>();
+            // 注册其他服务...
+        }
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            base.OnStartup(e);
+
+            var mainWindow = serviceProvider.GetRequiredService<MainWindow>();
+            mainWindow.Show();
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            base.OnExit(e);
+            
+            if (serviceProvider is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
 }
