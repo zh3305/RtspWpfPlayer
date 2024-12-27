@@ -24,6 +24,8 @@ public class VideoPlayer : IDisposable
     private volatile bool _isPlaying;
     private readonly SemaphoreSlim _playbackSemaphore = new(1, 1);
     private const int StopTimeoutMs = 3000; // 3秒超时
+    private const int MAX_RECONNECT_ATTEMPTS = 3;
+    private const int RECONNECT_DELAY_MS = 2000;
 
     public bool IsPlaying => _isPlaying;
     public string Url => _url;
@@ -109,88 +111,134 @@ public class VideoPlayer : IDisposable
 
     private unsafe void PlaybackLoop(CancellationToken token)
     {
-        AVFormatContext* formatContext = null;
-        AVCodecContext* codecContext = null;
-        AVFrame* frame = null;
-        AVPacket* packet = null;
+        int reconnectAttempts = 0;
+        bool needReconnect = true;
 
-        try
+        while (needReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS && !token.IsCancellationRequested)
         {
-            _logger.LogInformation("Starting playback for URL: {Url}", _url);
-
-            // 设置较短的网络超时
-            var options = ffmpeg.avformat_alloc_context();
-            var timeout = 1000000; // 1秒 (以微秒为单位)
-            ffmpeg.av_dict_set(&options->metadata, "stimeout", timeout.ToString(), 0);
-            ffmpeg.av_dict_set(&options->metadata, "rtsp_transport", "tcp", 0);
-
-            int result = ffmpeg.avformat_open_input(&formatContext, _url, null, null);
-            if (result < 0)
+            if (reconnectAttempts > 0)
             {
-                throw new FFmpegException("Failed to open input", result);
+                _logger.LogInformation("Attempting to reconnect ({Attempt}/{MaxAttempts})...", 
+                    reconnectAttempts + 1, MAX_RECONNECT_ATTEMPTS);
+                Thread.Sleep(RECONNECT_DELAY_MS); // 使用 Thread.Sleep 替代 Task.Delay
             }
 
-            if (ffmpeg.avformat_find_stream_info(formatContext, null) < 0)
+            AVFormatContext* formatContext = null;
+            AVCodecContext* codecContext = null;
+            AVFrame* frame = null;
+            AVPacket* packet = null;
+
+            try
             {
-                throw new FFmpegException("Failed to find stream info", -1);
-            }
+                _logger.LogInformation("Starting playback for URL: {Url}", _url);
 
-            var videoStream = FindVideoStream(formatContext);
-            var codec = SetupCodec(formatContext, videoStream, out codecContext);
-            
-            _logger.LogInformation("Using codec: {CodecName}", Marshal.PtrToStringAnsi((IntPtr)codec->name));
+                // 设置网络选项
+                AVDictionary* dict = null;
+                ffmpeg.av_dict_set(&dict, "stimeout", "2000000", 0);  // 2秒超时
+                ffmpeg.av_dict_set(&dict, "rtsp_transport", "tcp", 0);
+                ffmpeg.av_dict_set(&dict, "buffer_size", "1024000", 0); // 设置缓冲区大小
+                ffmpeg.av_dict_set(&dict, "max_delay", "500000", 0);   // 最大延迟500ms
+                ffmpeg.av_dict_set(&dict, "reconnect", "1", 0);        // 启用重连
+                ffmpeg.av_dict_set(&dict, "reconnect_at_eof", "1", 0); // 文件结束时重连
+                ffmpeg.av_dict_set(&dict, "reconnect_streamed", "1", 0); // 流媒体重连
+                ffmpeg.av_dict_set(&dict, "reconnect_delay_max", "2", 0); // 最大重连延迟
 
-            ConfigureHardwareAcceleration(codecContext);
-            
-            if (ffmpeg.avcodec_open2(codecContext, codec, null) < 0)
-            {
-                throw new InvalidOperationException("Failed to open codec");
-            }
-
-            frame = ffmpeg.av_frame_alloc();
-            packet = ffmpeg.av_packet_alloc();
-
-            while (!token.IsCancellationRequested && _isPlaying)
-            {
-                // 添加超时检查
-                if (token.IsCancellationRequested)
-                {
-                    _logger.LogInformation("Cancellation requested, breaking playback loop");
-                    break;
-                }
-
-                // 使用较短的读取超时
-                result = ffmpeg.av_read_frame(formatContext, packet);
+                int result = ffmpeg.avformat_open_input(&formatContext, _url, null, &dict);
                 if (result < 0)
                 {
-                    if (result == ffmpeg.AVERROR_EOF || result == ffmpeg.AVERROR(ffmpeg.EAGAIN))
-                    {
-                        _logger.LogInformation("End of stream or timeout reached");
-                        break;
-                    }
-                    throw new FFmpegException("Error reading frame", result);
+                    throw new FFmpegException("Failed to open input", result);
                 }
 
-                if (packet->stream_index == videoStream)
+                if (ffmpeg.avformat_find_stream_info(formatContext, null) < 0)
                 {
-                    ProcessVideoPacket(codecContext, frame, packet);
+                    throw new FFmpegException("Failed to find stream info", -1);
                 }
 
-                ffmpeg.av_packet_unref(packet);
+                var videoStream = FindVideoStream(formatContext);
+                var codec = SetupCodec(formatContext, videoStream, out codecContext);
+                
+                ConfigureHardwareAcceleration(codecContext);
+                
+                if (ffmpeg.avcodec_open2(codecContext, codec, null) < 0)
+                {
+                    throw new InvalidOperationException("Failed to open codec");
+                }
+
+                frame = ffmpeg.av_frame_alloc();
+                packet = ffmpeg.av_packet_alloc();
+
+                int errorCount = 0;
+                const int MAX_ERRORS = 5;
+                DateTime lastErrorTime = DateTime.Now;
+
+                while (!token.IsCancellationRequested && _isPlaying)
+                {
+                    if (token.IsCancellationRequested) break;
+
+                    result = ffmpeg.av_read_frame(formatContext, packet);
+                    if (result < 0)
+                    {
+                        if (result == ffmpeg.AVERROR_EOF)
+                        {
+                            _logger.LogInformation("End of stream reached");
+                            break;
+                        }
+                        
+                        if (DateTime.Now - lastErrorTime > TimeSpan.FromSeconds(5))
+                        {
+                            errorCount = 0;
+                            lastErrorTime = DateTime.Now;
+                        }
+
+                        errorCount++;
+                        if (errorCount > MAX_ERRORS)
+                        {
+                            _logger.LogWarning("Too many errors, attempting reconnect");
+                            break;
+                        }
+
+                        Thread.Sleep(100); // 使用 Thread.Sleep 替代 Task.Delay
+                        continue;
+                    }
+
+                    if (packet->stream_index == videoStream)
+                    {
+                        ProcessVideoPacket(codecContext, frame, packet);
+                        errorCount = 0; // 重置错误计数
+                    }
+
+                    ffmpeg.av_packet_unref(packet);
+                }
+
+                // 如果是正常退出，不需要重连
+                if (token.IsCancellationRequested || !_isPlaying)
+                {
+                    needReconnect = false;
+                }
             }
-        }
-        catch (Exception ex)
-        {
-            if (!token.IsCancellationRequested)
+            catch (Exception ex)
             {
-                _logger.LogError(ex, "Error in playback loop");
-                OnError?.Invoke(this, ex);
+                if (!token.IsCancellationRequested)
+                {
+                    _logger.LogError(ex, "Error in playback loop");
+                    OnError?.Invoke(this, ex);
+                    reconnectAttempts++;
+                }
+                else
+                {
+                    needReconnect = false;
+                }
+            }
+            finally
+            {
+                CleanupResources(ref frame, ref packet, ref codecContext, ref formatContext);
             }
         }
-        finally
+
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS)
         {
-            _logger.LogInformation("Cleaning up resources");
-            CleanupResources(ref frame, ref packet, ref codecContext, ref formatContext);
+            _logger.LogError("Max reconnection attempts reached");
+            OnError?.Invoke(this, new Exception("Failed to reconnect after maximum attempts"));
         }
     }
 
@@ -235,10 +283,26 @@ public class VideoPlayer : IDisposable
 
         try
         {
-            AVFrame* swFrame = ffmpeg.av_frame_alloc();
+            // 检查帧数据是否有效
+            if (frame->data[0] == null)
+            {
+                _logger.LogWarning("Invalid frame data");
+                return;
+            }
+
+            // 确定源格式
+            var srcFormat = (AVPixelFormat)frame->format;
+            if (srcFormat == AVPixelFormat.AV_PIX_FMT_NONE)
+            {
+                _logger.LogWarning("Invalid pixel format");
+                return;
+            }
+
+            var swFrame = ffmpeg.av_frame_alloc();
             try
             {
-                swFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12;
+                // 设置目标帧参数
+                swFrame->format = (int)AVPixelFormat.AV_PIX_FMT_BGRA;
                 swFrame->width = frame->width;
                 swFrame->height = frame->height;
 
@@ -249,14 +313,51 @@ public class VideoPlayer : IDisposable
                     return;
                 }
 
-                ret = ffmpeg.av_hwframe_transfer_data(swFrame, frame, 0);
+                // 确保帧数据对齐
+                ret = ffmpeg.av_frame_make_writable(swFrame);
                 if (ret < 0)
                 {
-                    _logger.LogError("Failed to transfer hardware frame data: {Error}", ret);
+                    _logger.LogError("Failed to make frame writable: {Error}", ret);
                     return;
                 }
 
-                UpdateBitmap(swFrame);
+                var swsContext = ffmpeg.sws_getContext(
+                    frame->width, frame->height, srcFormat,
+                    frame->width, frame->height, AVPixelFormat.AV_PIX_FMT_BGRA,
+                    ffmpeg.SWS_BILINEAR | ffmpeg.SWS_ACCURATE_RND, null, null, null);
+
+                if (swsContext == null)
+                {
+                    _logger.LogError("Failed to create SwsContext");
+                    return;
+                }
+
+                try
+                {
+                    // 检查源和目标数据指针
+                    if (frame->data[0] != null && swFrame->data[0] != null)
+                    {
+                        ret = ffmpeg.sws_scale(swsContext,
+                            frame->data, frame->linesize, 0, frame->height,
+                            swFrame->data, swFrame->linesize);
+
+                        if (ret < 0)
+                        {
+                            _logger.LogError("Failed to convert frame: {Error}", ret);
+                            return;
+                        }
+
+                        UpdateBitmap(swFrame);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Invalid data pointers");
+                    }
+                }
+                finally
+                {
+                    ffmpeg.sws_freeContext(swsContext);
+                }
             }
             finally
             {
@@ -273,6 +374,8 @@ public class VideoPlayer : IDisposable
 
     private unsafe void UpdateBitmap(AVFrame* frame)
     {
+        if (frame == null || frame->data[0] == null) return;
+
         _targetImage.Dispatcher.Invoke(() =>
         {
             try
@@ -296,7 +399,21 @@ public class VideoPlayer : IDisposable
                     _currentBitmap.Lock();
                     try
                     {
-                        ConvertAndCopyFrame(frame);
+                        var stride = frame->linesize[0];
+                        var dataPtr = frame->data[0];
+                        var bufferSize = stride * frame->height;
+
+                        unsafe
+                        {
+                            Buffer.MemoryCopy(
+                                dataPtr,
+                                (void*)_currentBitmap.BackBuffer,
+                                bufferSize,
+                                bufferSize);
+                        }
+
+                        _currentBitmap.AddDirtyRect(
+                            new Int32Rect(0, 0, frame->width, frame->height));
                     }
                     finally
                     {
@@ -310,39 +427,6 @@ public class VideoPlayer : IDisposable
                 OnError?.Invoke(this, ex);
             }
         });
-    }
-
-    private unsafe void ConvertAndCopyFrame(AVFrame* frame)
-    {
-        var swsContext = ffmpeg.sws_getContext(
-            frame->width, frame->height, AVPixelFormat.AV_PIX_FMT_NV12,
-            frame->width, frame->height, AVPixelFormat.AV_PIX_FMT_BGRA,
-            ffmpeg.SWS_BILINEAR, null, null, null);
-
-        if (swsContext == null)
-        {
-            _logger.LogError("Failed to create SwsContext");
-            return;
-        }
-
-        try
-        {
-            byte_ptrArray4 dstData = new byte_ptrArray4();
-            int_array4 dstLinesize = new int_array4();
-
-            dstData[0] = (byte*)_currentBitmap.BackBuffer;
-            dstLinesize[0] = _currentBitmap.BackBufferStride;
-
-            ffmpeg.sws_scale(swsContext,
-                frame->data, frame->linesize, 0, frame->height,
-                dstData, dstLinesize);
-
-            _currentBitmap.AddDirtyRect(new Int32Rect(0, 0, frame->width, frame->height));
-        }
-        finally
-        {
-            ffmpeg.sws_freeContext(swsContext);
-        }
     }
 
     private void InitializeVideoDisplay()
@@ -464,21 +548,89 @@ public class VideoPlayer : IDisposable
         {
             _getFormatCallback = (ctx, fmt) =>
             {
-                _logger.LogInformation("Selecting pixel format for hardware acceleration");
-                return AVPixelFormat.AV_PIX_FMT_DXVA2_VLD;
+                var formats = new List<AVPixelFormat>();
+                var p = fmt;
+                while (*p != AVPixelFormat.AV_PIX_FMT_NONE)
+                {
+                    formats.Add(*p);
+                    p++;
+                }
+
+                // 首先尝试使用原始格式
+                var originalFormat = codecContext->pix_fmt;
+                if (formats.Contains(originalFormat))
+                {
+                    _logger.LogInformation("Using original format: {Format}", originalFormat);
+                    return originalFormat;
+                }
+
+                // 然后尝试常用格式
+                var preferredFormats = new[]
+                {
+                    AVPixelFormat.AV_PIX_FMT_YUV420P,
+                    AVPixelFormat.AV_PIX_FMT_NV12,
+                    AVPixelFormat.AV_PIX_FMT_YUV444P,
+                    AVPixelFormat.AV_PIX_FMT_BGRA
+                };
+
+                foreach (var format in preferredFormats)
+                {
+                    if (formats.Contains(format))
+                    {
+                        _logger.LogInformation("Using preferred format: {Format}", format);
+                        return format;
+                    }
+                }
+
+                // 如果都不支持，使用第一个可用格式
+                _logger.LogInformation("Using first available format: {Format}", formats[0]);
+                return formats[0];
             };
 
-            _getFormatCallbackHandle = GCHandle.Alloc(_getFormatCallback);
-            codecContext->get_format = new AVCodecContext_get_format_func 
-            { 
-                Pointer = Marshal.GetFunctionPointerForDelegate(_getFormatCallback)
-            };
+            _getFormatCallbackHandle = GCHandle.Alloc(_getFormatCallback, GCHandleType.Normal);
+            codecContext->get_format = new AVCodecContext_get_format_func(){Pointer = Marshal.GetFunctionPointerForDelegate(_getFormatCallback)};
 
-            // 设置线程数为1，避免多线程问题
-            codecContext->thread_count = 1;
-            codecContext->thread_type = ffmpeg.FF_THREAD_SLICE;
+            _logger.LogInformation("Pixel format configuration completed");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to configure pixel format");
+        }
+    }
 
-            // 创建硬件设备上下文
+    private unsafe bool IsHardwareAccelerationSupported(AVCodecContext* codecContext)
+    {
+        try
+        {
+            var deviceType = AVHWDeviceType.AV_HWDEVICE_TYPE_DXVA2;
+            var config = ffmpeg.avcodec_get_hw_config(codecContext->codec, 0);
+            
+            if (config == null)
+            {
+                _logger.LogInformation("No hardware config available");
+                return false;
+            }
+
+            // 简化硬件加速检查
+            if (config->device_type != deviceType)
+            {
+                _logger.LogInformation("DXVA2 not supported for this codec");
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error checking hardware acceleration support");
+            return false;
+        }
+    }
+
+    private unsafe bool TryCreateHardwareDeviceContext(AVCodecContext* codecContext)
+    {
+        try
+        {
             int result = ffmpeg.av_hwdevice_ctx_create(
                 &codecContext->hw_device_ctx,
                 AVHWDeviceType.AV_HWDEVICE_TYPE_DXVA2,
@@ -488,14 +640,16 @@ public class VideoPlayer : IDisposable
 
             if (result < 0)
             {
-                throw new FFmpegException("Failed to create hardware device context", result);
+                _logger.LogWarning("Failed to create hardware device context: {Error}", result);
+                return false;
             }
 
             // 创建硬件帧上下文
             var hwFramesContext = ffmpeg.av_hwframe_ctx_alloc(codecContext->hw_device_ctx);
             if (hwFramesContext == null)
             {
-                throw new Exception("Failed to create hardware frame context");
+                _logger.LogWarning("Failed to create hardware frame context");
+                return false;
             }
 
             var framesContext = (AVHWFramesContext*)hwFramesContext->data;
@@ -509,18 +663,19 @@ public class VideoPlayer : IDisposable
             if (result < 0)
             {
                 ffmpeg.av_buffer_unref(&hwFramesContext);
-                throw new FFmpegException("Failed to initialize hardware frame context", result);
+                _logger.LogWarning("Failed to initialize hardware frame context");
+                return false;
             }
 
             codecContext->hw_frames_ctx = ffmpeg.av_buffer_ref(hwFramesContext);
             ffmpeg.av_buffer_unref(&hwFramesContext);
 
-            _logger.LogInformation("Hardware acceleration configured successfully");
+            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to configure hardware acceleration");
-            throw;
+            _logger.LogError(ex, "Error creating hardware device context");
+            return false;
         }
     }
 

@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Logging;
 using FFmpeg.AutoGen;
 using System.Windows;
+using Microsoft.Extensions.Logging.Console;
 
 namespace WpfVideoPlayer
 {
@@ -39,11 +40,22 @@ namespace WpfVideoPlayer
         {
             services.AddLogging(builder =>
             {
-                builder.AddConsole();
+                builder.AddConsole(options =>
+                {
+                    options.FormatterName = "CustomFormatter";
+                });
+
+                builder.Services.Configure<ConsoleFormatterOptions>(options =>
+                {
+                    options.IncludeScopes = true;
+                    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss.fff";
+                });
+
                 builder.AddDebug();
-                // 可以添加文件日志
-                // builder.AddFile("logs/videoplayer-{Date}.txt");
             });
+
+            // 注册自定义格式化器
+            services.AddSingleton<ConsoleFormatter, CustomConsoleFormatter>();
 
             // 注册主窗口
             services.AddSingleton<MainWindow>();
