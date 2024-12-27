@@ -8,8 +8,9 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using FFmpeg.AutoGen;
 using Microsoft.Extensions.Logging;
+using WpfVideoPlayer.Interfaces;
 
-public class VideoPlayer : IDisposable
+public class VideoPlayer : IVideoPlayer
 {
     private readonly CancellationTokenSource _cts = new();
     private WriteableBitmap _currentBitmap;
@@ -264,10 +265,30 @@ public class VideoPlayer : IDisposable
                     break;
                 }
 
-                _logger.LogTrace("Decoded frame: {Width}x{Height}, format: {Format}, pts: {Pts}",
-                    frame->width, frame->height, frame->format, frame->pts);
-
-                RenderFrame(frame);
+                // 如果是硬件帧，需要转换到系统内存
+                if (frame->format == (int)AVPixelFormat.AV_PIX_FMT_DXVA2_VLD)
+                {
+                    var swFrame = ffmpeg.av_frame_alloc();
+                    try
+                    {
+                        ret = ffmpeg.av_hwframe_transfer_data(swFrame, frame, 0);
+                        if (ret < 0)
+                        {
+                            _logger.LogError("Error transferring hw frame: {Error}", ret);
+                            continue;
+                        }
+                        RenderFrame(swFrame);
+                    }
+                    finally
+                    {
+                        var temp = swFrame;
+                        ffmpeg.av_frame_free(&temp);
+                    }
+                }
+                else
+                {
+                    RenderFrame(frame);
+                }
             }
         }
         catch (Exception ex)
@@ -521,7 +542,13 @@ public class VideoPlayer : IDisposable
     private unsafe AVCodec* SetupCodec(AVFormatContext* formatContext, int videoStream, out AVCodecContext* codecContext)
     {
         var codecParams = formatContext->streams[videoStream]->codecpar;
-        var codec = ffmpeg.avcodec_find_decoder(codecParams->codec_id);
+        // 优先查找硬件解码器
+        var codec = ffmpeg.avcodec_find_decoder_by_name($"{ffmpeg.avcodec_get_name(codecParams->codec_id)}_dxva2");
+        if (codec == null)
+        {
+            // 回退到软解码
+            codec = ffmpeg.avcodec_find_decoder(codecParams->codec_id);
+        }
         if (codec == null)
         {
             throw new InvalidOperationException("Codec not found");
@@ -536,6 +563,17 @@ public class VideoPlayer : IDisposable
         if (ffmpeg.avcodec_parameters_to_context(codecContext, codecParams) < 0)
         {
             throw new InvalidOperationException("Failed to copy codec params to codec context");
+        }
+
+        // 尝试启用硬件加速
+        if (IsHardwareAccelerationSupported(codecContext))
+        {
+            codecContext->hw_device_ctx = null;
+            if (TryCreateHardwareDeviceContext(codecContext))
+            {
+                _logger.LogInformation("Hardware acceleration enabled");
+                codecContext->get_format = null; // 使用硬件加速时不需要自定义格式选择
+            }
         }
 
         _logger.LogInformation("Codec setup completed: {CodecName}", Marshal.PtrToStringAnsi((IntPtr)codec->name));

@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.12.35527.113 d17.12
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WpfVideoPlayer", "wpfTest2\WpfVideoPlayer.csproj", "{5892AF8A-3229-4E34-82E8-D587B71C1E93}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WpfVideoPlayer", "WpfVideoPlayer\WpfVideoPlayer.csproj", "{5892AF8A-3229-4E34-82E8-D587B71C1E93}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

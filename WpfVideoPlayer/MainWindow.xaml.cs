@@ -5,6 +5,9 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Console;
+using WpfVideoPlayer.Factory;
+using WpfVideoPlayer.Interfaces;
 
 namespace WpfVideoPlayer
 {
@@ -13,8 +16,10 @@ namespace WpfVideoPlayer
     /// </summary>
     public partial class MainWindow : Window
     {
-        private readonly List<VideoPlayer> videoPlayers = new();
-        private readonly ILogger<VideoPlayer> _logger;
+        private readonly List<IVideoPlayer> videoPlayers = new();
+        private readonly ILoggerFactory _loggerFactory;
+        private readonly VideoPlayerFactory _playerFactory;
+        private readonly Grid mainGrid;
         private readonly Grid videoGrid;
         private bool isUpdatingLayout = false;
         private readonly DispatcherTimer resizeTimer;
@@ -24,38 +29,54 @@ namespace WpfVideoPlayer
         private readonly List<string> rtspUrls = new()
         {
             "rtsp://admin:ruixin888888@192.168.0.214/h264/ch1/sub/av_stream",
-            "rtsp://192.168.0.6:8554/s1",
-            "rtsp://192.168.0.6:8554/s2",
-            "rtsp://192.168.0.6:8554/s3",
-            "rtsp://192.168.0.6:8554/s4",
-            "rtsp://192.168.0.6:8554/s5",
-            "rtsp://192.168.0.6:8554/s6",
-            "rtsp://192.168.0.6:8554/s7",
-            "rtsp://192.168.0.6:8554/s8",
+            // "rtsp://192.168.0.6:8554/s1",
+            // "rtsp://192.168.0.6:8554/s2",
+            // "rtsp://192.168.0.6:8554/s3",
+            // "rtsp://192.168.0.6:8554/s4",
+            // "rtsp://192.168.0.6:8554/s5",
+            // "rtsp://192.168.0.6:8554/s6",
+            // "rtsp://192.168.0.6:8554/s7",
+            // "rtsp://192.168.0.6:8554/s8",
             // 添加更多 URL...
         };
 
-        public MainWindow(ILogger<VideoPlayer> logger)
+        // 当前使用的播放器类型
+        private VideoPlayerType _currentPlayerType = VideoPlayerType.DirectX11;
+
+        public MainWindow(ILoggerFactory loggerFactory)
         {
             InitializeComponent();
-            _logger = logger;
+            _loggerFactory = loggerFactory;
+            _playerFactory = new VideoPlayerFactory(loggerFactory);
+
+            // 初始化主网格
+            mainGrid = new Grid();
+            mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            mainGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
             // 初始化视频网格
             videoGrid = new Grid();
-            Content = videoGrid;
+            Grid.SetRow(videoGrid, 1);
+            mainGrid.Children.Add(videoGrid);
 
+            // 设置主窗口内容
+            Content = mainGrid;
+
+            // 添加事件处理
             Loaded += MainWindow_Loaded;
             Closing += MainWindow_Closing;
 
             // 初始化调整大小的计时器
             resizeTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromMilliseconds(500) // 500ms 延迟
+                Interval = TimeSpan.FromMilliseconds(500)
             };
             resizeTimer.Tick += ResizeTimer_Tick;
 
-            // 改用 SourceUpdated 事件而不是 SizeChanged
             SizeChanged += MainWindow_SizeChanged;
+
+            // 添加播放器类型选择菜单
+            CreatePlayerTypeMenu();
         }
 
         private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -85,7 +106,6 @@ namespace WpfVideoPlayer
             try
             {
                 isUpdatingLayout = true;
-                _logger.LogInformation("Starting layout update");
 
                 int count = rtspUrls.Count;
                 if (count == 0) return;
@@ -151,24 +171,24 @@ namespace WpfVideoPlayer
                     Grid.SetColumn(container, col);
                     videoGrid.Children.Add(container);
 
-                    var player = new VideoPlayer(image, rtspUrls[i], _logger);
+                    // 使用工厂创建播放器
+                    var player = _playerFactory.CreatePlayer(_currentPlayerType, image, rtspUrls[i]);
                     videoPlayers.Add(player);
                     startTasks.Add(player.StartAsync());
 
                     // 添加右键菜单
                     var contextMenu = new ContextMenu();
                     var menuItem = new MenuItem { Header = "全屏" };
-                    menuItem.Click += (s, e) => ToggleFullScreen(container, player);
+                    menuItem.Click += (s, e) => ToggleFullScreen(container);
                     contextMenu.Items.Add(menuItem);
                     container.ContextMenu = contextMenu;
                 }
 
                 await Task.WhenAll(startTasks.ToArray());
-                _logger.LogInformation("Layout update completed");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error updating video layout");
+                _loggerFactory.CreateLogger<MainWindow>().LogError(ex, "Error updating video layout");
             }
             finally
             {
@@ -176,7 +196,7 @@ namespace WpfVideoPlayer
             }
         }
 
-        private void ToggleFullScreen(Border container, VideoPlayer player)
+        private void ToggleFullScreen(Border container)
         {
             if (container.Parent == videoGrid)
             {
@@ -208,7 +228,7 @@ namespace WpfVideoPlayer
         {
             if (isClosing) 
             {
-                // 如果已经在关闭过程中，不再取消关闭
+                // 如果已经在关闭过程中，不再取关闭
                 e.Cancel = false;
                 return;
             }
@@ -218,7 +238,7 @@ namespace WpfVideoPlayer
 
             try
             {
-                _logger.LogInformation("Starting window closing process");
+                _loggerFactory.CreateLogger<MainWindow>().LogInformation("Starting window closing process");
                 var stopTasks = videoPlayers.Select(p => p.StopAsync()).ToList();
                 await Task.WhenAll(stopTasks);
 
@@ -227,11 +247,11 @@ namespace WpfVideoPlayer
                     player.Dispose();
                 }
                 videoPlayers.Clear();
-                _logger.LogInformation("All video players stopped and disposed");
+                _loggerFactory.CreateLogger<MainWindow>().LogInformation("All video players stopped and disposed");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error during window closing");
+                _loggerFactory.CreateLogger<MainWindow>().LogError(ex, "Error during window closing");
             }
             finally
             {
@@ -245,7 +265,7 @@ namespace WpfVideoPlayer
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error during application shutdown");
+                        _loggerFactory.CreateLogger<MainWindow>().LogError(ex, "Error during application shutdown");
                     }
                 }), DispatcherPriority.Normal);
             }
@@ -268,5 +288,39 @@ namespace WpfVideoPlayer
                 UpdateVideoLayoutAsync();
             }
         }
+
+        private void CreatePlayerTypeMenu()
+        {
+            var menu = new Menu();
+            var playerTypeMenuItem = new MenuItem { Header = "播放器类型" };
+            
+            foreach (VideoPlayerType type in Enum.GetValues(typeof(VideoPlayerType)))
+            {
+                var item = new MenuItem 
+                { 
+                    Header = type.ToString(),
+                    IsCheckable = true,
+                    IsChecked = type == _currentPlayerType
+                };
+                
+                item.Click += async (s, e) => 
+                {
+                    if (type != _currentPlayerType)
+                    {
+                        _currentPlayerType = type;
+                        await UpdateVideoLayoutAsync();
+                    }
+                };
+                
+                playerTypeMenuItem.Items.Add(item);
+            }
+            
+            menu.Items.Add(playerTypeMenuItem);
+            
+            // 将菜单添加到主网格的第一行
+            Grid.SetRow(menu, 0);
+            mainGrid.Children.Add(menu);
+        }
+
     }
 }

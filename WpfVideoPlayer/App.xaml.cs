@@ -66,6 +66,8 @@ namespace WpfVideoPlayer
         {
             base.OnStartup(e);
 
+
+            // var mainWindow = new MainWindow(serviceProvider.GetRequiredService<ILoggerFactory>());
             var mainWindow = serviceProvider.GetRequiredService<MainWindow>();
             mainWindow.Show();
         }
